@@ -186,17 +186,4 @@ public interface RegistrationStatusService<T, U, D> {
 	 */
 	public CompletableFuture<List<InternalRegistrationStatusDto>> getUnProcessedPackets(List<String> processList, Integer fetchSize, long elapseTime, Integer reprocessCount,
 																						List<String> trnStatusList, List<String> excludeStageNames, List<String> statusList);
-
-	/**
-	 * Update registration status for workflow Engine.
-	 *
-	 * @param registrationStatusDtos
-	 *            the list of registration status dto
-	 * @param moduleId
-	 *            the module id
-	 * @param moduleName
-	 *            the module name
-	 */
-	public void updateRegistrationStatusForWorkflowEngines(List<U> registrationStatusDtos, String moduleId, String moduleName);
-
 }

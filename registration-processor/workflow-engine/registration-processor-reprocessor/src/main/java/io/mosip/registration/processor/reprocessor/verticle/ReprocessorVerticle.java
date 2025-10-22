@@ -47,6 +47,7 @@ import io.vertx.core.eventbus.EventBus;
 import io.vertx.core.json.JsonObject;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 
 /**
  * The Reprocessor Verticle to deploy the scheduler and implement re-processing
@@ -116,7 +117,7 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 	private ConcurrentHashMap<String,ConcurrentLinkedQueue<InternalRegistrationStatusDto>> packetCacheMap = new ConcurrentHashMap<>();
 
 	/** The is transaction successful. */
-	private boolean isTransactionSuccessful = false;
+	private boolean isBatchSuccessful = true;
 
 	/** The registration status service. */
 	@Autowired
@@ -133,6 +134,14 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 	/** The port. */
 	@Value("${server.port}")
 	private String port;
+
+	private final ExecutorService sendExecutor = new ThreadPoolExecutor(
+			Math.max(2, Runtime.getRuntime().availableProcessors()),
+			Math.max(2, Runtime.getRuntime().availableProcessors()),
+			60L, TimeUnit.SECONDS,
+			new ArrayBlockingQueue<>(5000), // bounded queue
+			new ThreadPoolExecutor.CallerRunsPolicy()
+	);
 
 	@PostConstruct
 	public void init() throws JsonProcessingException {
@@ -243,6 +252,7 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 	 */
 	@Override
 	public MessageDTO process(MessageDTO object) {
+		Long startTime = System.currentTimeMillis();
 		List<InternalRegistrationStatusDto> reprocessorDtoList = null;
 		LogDescription description = new LogDescription();
 		List<String> trnStatusList = new ArrayList<>();
@@ -251,7 +261,7 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 		trnStatusList.add(RegistrationTransactionStatusCode.IN_PROGRESS.toString());
 		regProcLogger.debug(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(), "",
 				"ReprocessorVerticle::process()::entry");
-		StringBuffer ridSb = new StringBuffer();
+		ConcurrentLinkedQueue<String> ridSb = new ConcurrentLinkedQueue<>();
 		try {
 			Map<String, Set<String>> reprocessRestartTriggerMap = intializeReprocessRestartTriggerMapping();
 			reprocessorDtoList = registrationStatusService.getResumablePackets(fetchSize);
@@ -298,83 +308,95 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 					"Reprocessor Total Packets Fetched " + reprocessorDtoList.size());
 
 			if (!CollectionUtils.isEmpty(reprocessorDtoList)) {
-				List<InternalRegistrationStatusDto> processedList = new ArrayList<>();
-				/** Module-Id can be Both Success/Error code */
-				String moduleId = PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_SUCCESS.getCode();
-				String moduleName = ModuleName.RE_PROCESSOR.toString();
+				List<CompletableFuture<Void>> sendTasks = reprocessorDtoList.stream()
+								.map(dto -> CompletableFuture.runAsync(() -> {
+									{
+										boolean isTransactionSuccessful = false;
+										String registrationId = dto.getRegistrationId();
+										regProcLogger.info(LoggerFileConstant.SESSIONID.toString(),
+												LoggerFileConstant.REGISTRATIONID.toString(), registrationId, "Process started");
+										ridSb.add(registrationId);
+										MessageDTO messageDTO = new MessageDTO();
+										messageDTO.setRid(registrationId);
+										messageDTO.setReg_type(dto.getRegistrationType());
+										messageDTO.setSource(dto.getSource());
+										messageDTO.setIteration(dto.getIteration());
+										messageDTO.setWorkflowInstanceId(dto.getWorkflowInstanceId());
+										if (reprocessCount.equals(dto.getReProcessRetryCount())) {
+											dto.setLatestTransactionStatusCode(
+													RegistrationTransactionStatusCode.REPROCESS_FAILED.toString());
+											dto.setLatestTransactionTypeCode(
+													RegistrationTransactionTypeCode.PACKET_REPROCESS.toString());
+											dto.setStatusComment(StatusUtil.RE_PROCESS_FAILED.getMessage());
+											dto.setStatusCode(RegistrationStatusCode.REPROCESS_FAILED.toString());
+											dto.setSubStatusCode(StatusUtil.RE_PROCESS_FAILED.getCode());
+											messageDTO.setIsValid(false);
+											description.setMessage(PlatformSuccessMessages.RPR_RE_PROCESS_FAILED.getMessage());
+											description.setCode(PlatformSuccessMessages.RPR_RE_PROCESS_FAILED.getCode());
 
-				reprocessorDtoList.forEach(dto -> {
-					String registrationId = dto.getRegistrationId();
-					ridSb.append(registrationId);
-					ridSb.append(",");
-					MessageDTO messageDTO = new MessageDTO();
-					messageDTO.setRid(registrationId);
-					messageDTO.setReg_type(dto.getRegistrationType());
-					messageDTO.setSource(dto.getSource());
-					messageDTO.setIteration(dto.getIteration());
-					messageDTO.setWorkflowInstanceId(dto.getWorkflowInstanceId());
-					if (reprocessCount.equals(dto.getReProcessRetryCount())) {
-						dto.setLatestTransactionStatusCode(
-								RegistrationTransactionStatusCode.REPROCESS_FAILED.toString());
-						dto.setLatestTransactionTypeCode(
-								RegistrationTransactionTypeCode.PACKET_REPROCESS.toString());
-						dto.setStatusComment(StatusUtil.RE_PROCESS_FAILED.getMessage());
-						dto.setStatusCode(RegistrationStatusCode.REPROCESS_FAILED.toString());
-						dto.setSubStatusCode(StatusUtil.RE_PROCESS_FAILED.getCode());
-						messageDTO.setIsValid(false);
-						description.setMessage(PlatformSuccessMessages.RPR_RE_PROCESS_FAILED.getMessage());
-						description.setCode(PlatformSuccessMessages.RPR_RE_PROCESS_FAILED.getCode());
+										} else {
+											messageDTO.setIsValid(true);
+											isTransactionSuccessful=true;
+											String stageName;
+											if (isRestartFromStageRequired(dto, reprocessRestartTriggerMap)) {
+												stageName = MessageBusUtil.getMessageBusAdress(reprocessRestartFromStage);
+												stageName = stageName.concat(ReprocessorConstants.BUS_IN);
+												sendAndSetStatus(dto, messageDTO, stageName);
+												dto.setStatusComment(StatusUtil.RE_PROCESS_RESTART_FROM_STAGE.getMessage());
+												dto.setSubStatusCode(StatusUtil.RE_PROCESS_RESTART_FROM_STAGE.getCode());
+												description
+														.setMessage(
+																PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_RESTART_FROM_STAGE_SUCCESS
+																		.getMessage());
+												description.setCode(
+														PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_RESTART_FROM_STAGE_SUCCESS
+																.getCode());
 
-					} else {
-						messageDTO.setIsValid(true);
-						isTransactionSuccessful = true;
-						String stageName;
-						if (isRestartFromStageRequired(dto, reprocessRestartTriggerMap)) {
-							stageName = MessageBusUtil.getMessageBusAdress(reprocessRestartFromStage);
-							stageName = stageName.concat(ReprocessorConstants.BUS_IN);
-							sendAndSetStatus(dto, messageDTO, stageName);
-							dto.setStatusComment(StatusUtil.RE_PROCESS_RESTART_FROM_STAGE.getMessage());
-							dto.setSubStatusCode(StatusUtil.RE_PROCESS_RESTART_FROM_STAGE.getCode());
-							description
-									.setMessage(
-											PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_RESTART_FROM_STAGE_SUCCESS
-													.getMessage());
-							description.setCode(
-									PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_RESTART_FROM_STAGE_SUCCESS
-											.getCode());
+											} else {
+												stageName = MessageBusUtil.getMessageBusAdress(dto.getRegistrationStageName());
+												if (RegistrationTransactionStatusCode.SUCCESS.name()
+														.equalsIgnoreCase(dto.getLatestTransactionStatusCode())) {
+													stageName = stageName.concat(ReprocessorConstants.BUS_OUT);
+												} else {
+													stageName = stageName.concat(ReprocessorConstants.BUS_IN);
+												}
+												sendAndSetStatus(dto, messageDTO, stageName);
+												dto.setStatusComment(StatusUtil.RE_PROCESS_COMPLETED.getMessage());
+												dto.setSubStatusCode(StatusUtil.RE_PROCESS_COMPLETED.getCode());
+												description.setMessage(PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_SUCCESS.getMessage());
+												description.setCode(PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_SUCCESS.getCode());
+											}
+										}
+										regProcLogger.info(LoggerFileConstant.SESSIONID.toString(),
+												LoggerFileConstant.REGISTRATIONID.toString(), registrationId, description.getMessage());
 
-						} else {
-							stageName = MessageBusUtil.getMessageBusAdress(dto.getRegistrationStageName());
-							if (RegistrationTransactionStatusCode.SUCCESS.name()
-									.equalsIgnoreCase(dto.getLatestTransactionStatusCode())) {
-								stageName = stageName.concat(ReprocessorConstants.BUS_OUT);
-							} else {
-								stageName = stageName.concat(ReprocessorConstants.BUS_IN);
-							}
-							sendAndSetStatus(dto, messageDTO, stageName);
-							dto.setStatusComment(StatusUtil.RE_PROCESS_COMPLETED.getMessage());
-							dto.setSubStatusCode(StatusUtil.RE_PROCESS_COMPLETED.getCode());
-							description.setMessage(PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_SUCCESS.getMessage());
-							description.setCode(PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_SUCCESS.getCode());
-						}
-					}
-					regProcLogger.info(LoggerFileConstant.SESSIONID.toString(),
-							LoggerFileConstant.REGISTRATIONID.toString(), registrationId, description.getMessage());
+										/** Module-Id can be Both Success/Error code */
+										String moduleId = PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_SUCCESS.getCode();
+										String moduleName = ModuleName.RE_PROCESSOR.toString();
+										registrationStatusService.updateRegistrationStatusForWorkflowEngine(dto, moduleId, moduleName);
+										String eventId = EventId.RPR_402.toString();
+										String eventName = EventName.UPDATE.toString();
+										String eventType = EventType.BUSINESS.toString();
 
-					String eventId = EventId.RPR_402.toString();
-					String eventName = EventName.UPDATE.toString();
-					String eventType = EventType.BUSINESS.toString();
-					processedList.add(dto);
+										if (!isTransactionSuccessful)
+											auditLogRequestBuilder.createAuditRequestBuilder(description.getMessage(), eventId, eventName,
+													eventType, moduleId, moduleName, registrationId);
+									}
+								},sendExecutor).exceptionally(ex -> {
+									regProcLogger.error(LoggerFileConstant.SESSIONID.toString(),
+											description.getCode() + " -- ",
+											PlatformErrorMessages.RPR_PKR_UNKNOWN_EXCEPTION.getMessage(), ex.toString());									return null;
+								})).collect(Collectors.toList());
 
-					if (!isTransactionSuccessful)
-						auditLogRequestBuilder.createAuditRequestBuilder(description.getMessage(), eventId, eventName,
-								eventType, moduleId, moduleName, registrationId);
-				});
+				CompletableFuture.allOf(sendTasks.toArray(new CompletableFuture[0])).whenComplete((res, ex) -> {
+					regProcLogger.error(LoggerFileConstant.SESSIONID.toString(),
+							"Error in Packet Processing -- ",
+							ex.getMessage(), ExceptionUtils.getStackTrace(ex));
 
-				registrationStatusService.updateRegistrationStatusForWorkflowEngines(processedList, moduleId, moduleName);
+				}).join();;
 			}
 		} catch (TablenotAccessibleException e) {
-			isTransactionSuccessful = false;
+			isBatchSuccessful = false;
 			object.setInternalError(Boolean.TRUE);
 			description.setMessage(PlatformErrorMessages.RPR_RGS_REGISTRATION_TABLE_NOT_ACCESSIBLE.getMessage());
 			description.setCode(PlatformErrorMessages.RPR_RGS_REGISTRATION_TABLE_NOT_ACCESSIBLE.getCode());
@@ -383,7 +405,7 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 					PlatformErrorMessages.RPR_RGS_REGISTRATION_TABLE_NOT_ACCESSIBLE.getMessage(), e.toString());
 
 		} catch (Exception ex) {
-			isTransactionSuccessful = false;
+			isBatchSuccessful = false;
 			description.setMessage(PlatformErrorMessages.REPROCESSOR_VERTICLE_FAILED.getMessage());
 			description.setCode(PlatformErrorMessages.REPROCESSOR_VERTICLE_FAILED.getCode());
 			regProcLogger.error(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(),
@@ -395,21 +417,23 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 		} finally {
 			regProcLogger.info(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(),
 					null, description.getMessage());
-			if (isTransactionSuccessful)
+			if (isBatchSuccessful)
 				description.setMessage(PlatformSuccessMessages.RPR_RE_PROCESS_SUCCESS.getMessage());
 
-			String eventId = isTransactionSuccessful ? EventId.RPR_402.toString() : EventId.RPR_405.toString();
-			String eventName = isTransactionSuccessful ? EventName.UPDATE.toString() : EventName.EXCEPTION.toString();
-			String eventType = isTransactionSuccessful ? EventType.BUSINESS.toString() : EventType.SYSTEM.toString();
+			String eventId = isBatchSuccessful ? EventId.RPR_402.toString() : EventId.RPR_405.toString();
+			String eventName = isBatchSuccessful ? EventName.UPDATE.toString() : EventName.EXCEPTION.toString();
+			String eventType = isBatchSuccessful ? EventType.BUSINESS.toString() : EventType.SYSTEM.toString();
 
 			/** Module-Id can be Both Success/Error code */
-			String moduleId = isTransactionSuccessful ? PlatformSuccessMessages.RPR_RE_PROCESS_SUCCESS.getCode()
+			String moduleId = isBatchSuccessful ? PlatformSuccessMessages.RPR_RE_PROCESS_SUCCESS.getCode()
 					: description.getCode();
 			String moduleName = ModuleName.RE_PROCESSOR.toString();
 			auditLogRequestBuilder.createAuditRequestBuilder(description.getMessage(), eventId, eventName, eventType,
-					moduleId, moduleName, ridSb.toString());
+					moduleId, moduleName, String.join(",", ridSb));
 		}
 
+		regProcLogger.info(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(),
+				null, "Total Time taken for Reprocessor Batch End " + ((System.currentTimeMillis() - startTime)/1000) );
 		return object;
 	}
 
@@ -622,4 +646,13 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 				.collect(Collectors.joining(", ", "[", "]"));
 	}
 
+	@PreDestroy
+	public void shutdown() {
+		sendExecutor.shutdown();
+		try {
+			sendExecutor.awaitTermination(30, TimeUnit.SECONDS);
+		} catch (InterruptedException e) {
+			throw new RuntimeException(e);
+		}
+	}
 }
